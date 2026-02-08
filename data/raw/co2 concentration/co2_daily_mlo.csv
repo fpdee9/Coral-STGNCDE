@@ -29,7 +29,9 @@
 # were suspended as of Nov. 29, 2022 and resumed in July 2023.
 # Observations starting from December 2022 to July 4, 2023 are from a site at the
 # Maunakea Observatories, approximately 21 miles north of the Mauna Loa Observatory.
-#
+#      Date               CO2 molfrac
+# (yr, mon, day, decimal)    (ppm)
+Year,Month,Day,Decimal_Date,CO2_Molecular_Fraction_in_ppm
 1974,5,19,1974.3781,333.46
 1974,5,20,1974.3808,333.64
 1974,5,21,1974.3836,333.50
