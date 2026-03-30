@@ -3,6 +3,12 @@
 # Ignore the Data Folder (Too large for GitHub)
 data/
 
+model_v1/
+results/
+src/code_v1
+src/data_acquisition
+
+
 # Ignore Python cache files
 __pycache__/
 *.pyc

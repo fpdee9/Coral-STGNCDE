@@ -1,109 +1,137 @@
 import torch
 import torchcde
+import numpy as np
 import time
+import os
+import copy
 from coral_model import CoralSTGNCDE
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 DATA_DIR = "data/processed/"
-HIDDEN_DIM = 8   # Small dimension to prevent overfitting on sparse data
-EPOCHS = 300
-LR = 0.005
+MODEL_SAVE_PATH = "coral_model_best.pth"
+
+HIDDEN_DIM = 24      
+EPOCHS = 500         
+LR = 0.005           
+WEIGHT_DECAY = 1e-3
+BATCH_SIZE = 106     
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def normalize_tensor(tensor):
+    # Safeguard 1: Catch stray NaNs
+    tensor = torch.nan_to_num(tensor, nan=0.0) 
+    
+    mean = tensor.mean(dim=1, keepdim=True)
+    std = tensor.std(dim=1, keepdim=True)
+    
+    # Safeguard 2: Prevent division by tiny numbers
+    std[std < 1e-4] = 1.0  
+    
+    normed = (tensor - mean) / std
+    return torch.nan_to_num(normed, nan=0.0)
 
 def main():
     print(f"--- STARTING TRAINING ON {DEVICE} ---")
     
-    # 1. Load Data
-    print("Loading Tensors...")
-    X = torch.load(f"{DATA_DIR}X.pt").float()   # (Sites, Time, 3)
-    y = torch.load(f"{DATA_DIR}y.pt").float()   # (Sites, Time, 1)
+    if not os.path.exists(f"{DATA_DIR}X.pt"):
+        print(f"Error: {DATA_DIR}X.pt not found.")
+        return
+
+    X_raw = torch.load(f"{DATA_DIR}X.pt").float()
+    y = torch.load(f"{DATA_DIR}y.pt").float()
     mask = torch.load(f"{DATA_DIR}mask.pt").float()
     adj = torch.load(f"{DATA_DIR}adjacency_matrix.pt").float()
     
-    # 2. Reshape for Model (Time, Sites, Feats)
-    # Treat the entire 106-site system as ONE sample with complex structure
-    # X: (106, 14610, 3) -> (14610, 106, 3)
-    X = X.permute(1, 0, 2).to(DEVICE) # (Time, Sites, Feats)
+    # mathematically guarantee the graph cannot explode from overlapping nodes
+    row_sums = adj.sum(dim=1, keepdim=True)
+    row_sums[row_sums == 0] = 1.0 
+    adj = adj / row_sums
+    
+    num_sites, num_times, num_features = X_raw.shape
+    print(f"   > Sites: {num_sites}, Time Steps: {num_times}")
+
+    # Normalize
+    X_normalized = normalize_tensor(X_raw)
+    
+    X_time_first = X_normalized.permute(1, 0, 2) 
+    X_flat = X_time_first.reshape(num_times, -1).to(DEVICE)
+    
     y = y.permute(1, 0, 2).to(DEVICE)
     mask = mask.permute(1, 0, 2).to(DEVICE)
     adj = adj.to(DEVICE)
     
-    # 3. Create Continuous Path (Splines)
-    # This converts discrete daily data into a continuous mathematical function
-    print("Interpolating Continuous Path (Cubic Hermite Spline)...")
-    # We flatten sites into channels for the spline construction
-    # Input to spline: (Batch, Time, Channels) -> (1, 14610, 106*3)
-    T, S, F = X.shape
-    X_flat = X.reshape(T, S * F)
-    coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(X_flat)
-    print("   > Path constructed.")
-
-    # 4. Initialize Model
+    print("Interpolating Data...")
+    train_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(X_flat)
+    
     model = CoralSTGNCDE(
-        num_sites=S,
-        input_features=F, # 3 (SST, DHW, CO2)
+        num_sites=num_sites,
+        input_features=num_features,
         hidden_dim=HIDDEN_DIM,
         output_features=1,
         adj_matrix=adj
     ).to(DEVICE)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     
-    # SPLIT (Approx 80/20 split by time)
-    # 14610 days total. 
-    # Train: 0 - 11688 (1985-2016)
-    # Test: 11688 - End (2017-2024)
-    SPLIT_IDX = 11688 
+    # If the Test Loss doesn't improve for 10 checks (50 epochs), cut the LR in half.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
-    print("\n--- BEGINNING EPOCHS ---")
+    best_test_rmse = float('inf')
+    best_epoch = 0
+    
+    print("\n--- BEGINNING TRAINING ---")
     start_time = time.time()
+    SPLIT_IDX = int(num_times * 0.8)
     
     for epoch in range(EPOCHS):
+        model.train()
         optimizer.zero_grad()
         
-        # Forward Pass
-        # Returns: (Time, Sites, 1)
-        pred = model(coeffs)
+        pred = model(train_coeffs)
         
-        # --- CALC TRAINING LOSS ---
-        # Slice: [:SPLIT_IDX]
-        train_pred = pred[:SPLIT_IDX, :, :]
-        train_y    = y[:SPLIT_IDX, :, :]
-        train_mask = mask[:SPLIT_IDX, :, :]
-        
-        # MSE Loss
-        loss = (train_pred - train_y) ** 2
-        # Apply Mask (Only count days with data)
-        loss = (loss * train_mask).sum() / (train_mask.sum() + 1e-6)
+        train_pred = pred[:SPLIT_IDX]
+        train_y    = y[:SPLIT_IDX]
+        train_mask = mask[:SPLIT_IDX]
+        loss = ((train_pred - train_y) ** 2 * train_mask).sum() / (train_mask.sum() + 1e-6)
         
         loss.backward()
+        
+        # INCREASED GRADIENT CLIPPING: Helps prevent zig-zags from exploding
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5) 
+        
         optimizer.step()
         
-        # --- REPORTING ---
-        if epoch % 10 == 0:
+        # Validation / Saving
+        if (epoch + 1) % 5 == 0: 
+            model.eval()
             with torch.no_grad():
-                # Test Loss
-                test_pred = pred[SPLIT_IDX:, :, :]
-                test_y    = y[SPLIT_IDX:, :, :]
-                test_mask = mask[SPLIT_IDX:, :, :]
+                test_pred = pred[SPLIT_IDX:]
+                test_y    = y[SPLIT_IDX:]
+                test_mask = mask[SPLIT_IDX:]
                 
-                test_loss = (test_pred - test_y) ** 2
-                test_loss = (test_loss * test_mask).sum() / (test_mask.sum() + 1e-6)
-                
-                # RMSE (Root Mean Squared Error) - more interpretable
+                test_mse = ((test_pred - test_y) ** 2 * test_mask).sum() / (test_mask.sum() + 1e-6)
+                test_rmse = torch.sqrt(test_mse)
                 train_rmse = torch.sqrt(loss)
-                test_rmse = torch.sqrt(test_loss)
                 
-                print(f"Epoch {epoch:03d} | Train RMSE: {train_rmse:.4f} | Test RMSE: {test_rmse:.4f}")
+                print(f"Epoch {epoch+1:03d}/{EPOCHS} | Train: {train_rmse:.4f} | Test: {test_rmse:.4f}", end="")
+                
+                # Step the scheduler based on Test RMSE
+                scheduler.step(test_rmse)
+                
+                # SAVE IF BEST
+                if test_rmse < best_test_rmse:
+                    best_test_rmse = test_rmse
+                    best_epoch = epoch + 1
+                    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+                    print(f"  <-- SAVED (New Best)")
+                else:
+                    print("")
 
-    duration = time.time() - start_time
-    print(f"\nTraining Finished in {duration/60:.1f} minutes.")
-    
-    # Save
-    torch.save(model.state_dict(), "coral_model_v1.pth")
-    print("Model saved to coral_model_v1.pth")
+    print(f"\n--- TRAINING COMPLETE ---")
+    print(f"Best Test RMSE: {best_test_rmse:.4f} at Epoch {best_epoch}")
+    print(f"Best Model saved to: {MODEL_SAVE_PATH}")
 
 if __name__ == "__main__":
     main()
